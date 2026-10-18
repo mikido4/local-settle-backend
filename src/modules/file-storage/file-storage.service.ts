@@ -12,5 +12,10 @@ export interface UploadFileInput {
 }
 
 export abstract class FileStorageService {
+  abstract deleteFile(storedUrl: string): Promise<void>;
   abstract uploadFile(file: UploadFileInput): Promise<StoredFile>;
+  abstract getSignedDownloadUrl(
+    storedUrl: string,
+    expiresInSeconds: number,
+  ): Promise<string>;
 }
