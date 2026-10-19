@@ -47,7 +47,7 @@ interface ChatServerEvents {
   [ChatEvent.USER_LEFT]: (event: { orderId: string; userId: string }) => void;
 }
 
-type CreatedChatMessage = ChatMessage & { clientMessageId?: string };
+type CreatedChatMessage = ChatMessage & { clientMessageId?: string; attachments?: import('./chat-message.service').ChatAttachmentDownload[] };
 
 type ChatSocket = Socket<
   Record<string, never>,
@@ -238,8 +238,9 @@ export class ChatMessageGateway implements OnGatewayInit, OnGatewayConnection {
       );
     }
 
-    const validation = validateChatMessageContent(body?.content);
-    if (!validation.valid) {
+    const evidenceIds = body?.attachmentEvidenceIds ?? [];
+    const validation = validateChatMessageContent(body?.content ?? '');
+    if (!validation.valid && !(validation.reason === 'empty' && evidenceIds.length > 0)) {
       const code =
         validation.reason === 'empty' || validation.reason === 'too_long'
           ? ChatErrorCode.EMPTY_MESSAGE
@@ -256,7 +257,7 @@ export class ChatMessageGateway implements OnGatewayInit, OnGatewayConnection {
         orderId,
       );
     }
-    const { content } = validation;
+    const content = validation.valid ? validation.content : '';
     if (body?.clientMessageId && !this.isValidOrderId(body.clientMessageId)) {
       return this.fail(
         client,
@@ -278,17 +279,16 @@ export class ChatMessageGateway implements OnGatewayInit, OnGatewayConnection {
 
     const accessError = await this.getAccessError(client, orderId);
     if (accessError) return this.failWith(client, accessError);
+    if (evidenceIds.length && !(await this.chatMessages.canAccessOrder(orderId, client.data.userId))) {
+      return this.fail(client, ChatErrorCode.UNAUTHORIZED_ORDER_ACCESS, 'Only order participants can attach evidence.', orderId);
+    }
 
     try {
-      const message = await this.chatMessages.create({
-        orderId,
-        senderId: client.data.userId,
-        content,
-      });
-      const createdMessage: CreatedChatMessage = {
-        ...message,
-        clientMessageId: body.clientMessageId,
-      };
+      const message = await this.chatMessages.createFromChat({ orderId, senderId: client.data.userId, content, attachmentEvidenceIds: evidenceIds, clientMessageId: body.clientMessageId });
+      const attachments = await this.chatMessages.getSignedAttachmentsForMessage(message.messageId, client.data.userId);
+      const publicMessage = { ...message } as ChatMessage & { attachmentRefs?: unknown };
+      delete publicMessage.attachmentRefs;
+      const createdMessage: CreatedChatMessage = { ...publicMessage, clientMessageId: body.clientMessageId, attachments };
       this.server.to(room).emit(ChatEvent.MESSAGE_CREATED, createdMessage);
       return { ok: true, data: createdMessage };
     } catch (error) {

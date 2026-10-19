@@ -8,6 +8,10 @@ import {
 } from 'class-validator';
 
 export class CreateOrderDto {
+  /** Stable UUID supplied by the client to make retries idempotent. */
+  @IsUUID()
+  idempotencyKey: string;
+
   @IsUUID()
   offerId: string;
 

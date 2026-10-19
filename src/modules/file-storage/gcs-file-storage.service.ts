@@ -105,6 +105,7 @@ export class GcsFileStorageService
       throw new Error('Stored evidence URL is outside the configured bucket');
     }
     const key = decodeURIComponent(storedUrl.slice(prefix.length));
+    if (!key.startsWith('evidence/')) throw new Error('Only evidence objects can be signed for download');
     const [url] = await this.bucket.file(key).getSignedUrl({
       version: 'v4',
       action: 'read',

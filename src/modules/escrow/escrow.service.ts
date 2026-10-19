@@ -475,6 +475,9 @@ export class EscrowService {
       file.originalname,
       file.mimetype,
     );
+    const extensionByType: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'application/pdf': 'pdf' };
+    const safeCandidate = file.originalname.split(/[\\/]/).pop()?.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 180);
+    const evidenceFileName = safeCandidate && safeCandidate !== '.' && safeCandidate !== '..' ? safeCandidate : `evidence.${extensionByType[file.mimetype]}`;
     if (!userId) {
       throw new AppException(
         ErrorCode.UNAUTHORIZED_ACTION,
@@ -525,6 +528,9 @@ export class EscrowService {
         evidenceUrl: result.url,
         evidenceKey: key,
         evidenceUploadedAt: new Date(),
+        evidenceFileName,
+        evidenceContentType: file.mimetype,
+        evidenceSize: file.size,
       });
       return { url: `/escrows/${id}/evidence` };
     } catch (error) {

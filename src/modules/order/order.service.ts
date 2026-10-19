@@ -1,5 +1,5 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { randomUUID } from 'crypto';
+import { ConflictException, Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { PaginationDto } from '../../common/pagination.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
@@ -85,39 +85,105 @@ export class OrderService {
   /**
    * Atomic order + escrow creation.
    *
-   * 1. Pre-generate an orderId (UUIDv4).
-   * 2. Call EscrowService.deployEscrowToChain() ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â interacts ONLY with TW API.
-   *    If this fails the method throws and NO database record is created.
-   * 3. Persist Order + EscrowOnChain in a single DB transaction.
-   * 4. Return the order data with the unsigned fund XDR so the frontend can
-   *    prompt the seller to sign.
+   * Reserve the caller's idempotency key before talking to the chain. The
+   * reservation gives every retry the same engagement/order ID and records a
+   * completed deployment before the order transaction starts, so a database
+   * failure after deployment can be retried without redeploying the escrow.
    */
   async create(dto: CreateOrderDto): Promise<OrderDetailResponse> {
-    const activeDuplicate = await this.repo.findActiveForOfferBuyer(
-      dto.offerId,
-      dto.buyerId,
-    );
-    if (activeDuplicate) {
-      throw new AppException(
-        ErrorCode.INVALID_ORDER_STATUS,
-        'An active order already exists for this buyer and offer.',
+    const requestHash = createHash('sha256')
+      .update(JSON.stringify({
+        offerId: dto.offerId,
+        buyerId: dto.buyerId,
+        sellerId: dto.sellerId,
+        assetAmount: dto.assetAmount,
+        fiatAmount: dto.fiatAmount,
+        orderStatus: dto.orderStatus ?? null,
+        expiresAt: dto.expiresAt ?? null,
+        sellerAddress: dto.sellerAddress,
+        buyerAddress: dto.buyerAddress,
+        assetCode: dto.assetCode,
+        title: dto.title ?? null,
+      }))
+      .digest('hex');
+    const { reservation, created } = await this.repo.reserveOrderCreation({
+      idempotencyKey: dto.idempotencyKey,
+      requestHash,
+      buyerId: dto.buyerId,
+      sellerId: dto.sellerId,
+    });
+    if (reservation.request_hash !== requestHash) {
+      throw new ConflictException(
+        'This idempotency key was already used with a different order request',
       );
     }
-
-    const orderId = randomUUID();
+    const orderId = reservation.order_id;
 
     this.logger.log(
       `Creating order ${orderId} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â deploying escrow to chain firstÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦`,
     );
 
-    const { contractId, unsignedFundTransaction } =
-      await this.escrowService.deployEscrowToChain(orderId, {
+    const existingOrder = await this.repo.findById(orderId);
+    if (existingOrder) {
+      await this.repo.completeOrderCreation(dto.idempotencyKey);
+      const contractId = existingOrder.escrow?.contractId;
+      if (!contractId || !reservation.unsigned_fund_transaction) {
+        throw new ConflictException(
+          'Order creation is persisted but its escrow response needs reconciliation',
+        );
+      }
+      return {
+        ...existingOrder,
+        escrowId: existingOrder.escrow.escrowId,
+        escrow: { escrowId: existingOrder.escrow.escrowId },
+        contractId,
+        unsignedFundTransaction: reservation.unsigned_fund_transaction,
+      };
+    }
+    if (reservation.status === 'completed') {
+      throw new ConflictException(
+        `Completed order creation ${orderId} has no persisted order and needs reconciliation`,
+      );
+    }
+    if (reservation.status === 'pending' && !created) {
+      throw new ConflictException(
+        `Order creation ${orderId} is already in progress or needs chain reconciliation`,
+      );
+    }
+
+    let contractId = reservation.contract_id;
+    let unsignedFundTransaction = reservation.unsigned_fund_transaction;
+    if (reservation.status === 'pending') {
+      const activeDuplicate = await this.repo.findActiveForOfferBuyer(
+        dto.offerId,
+        dto.buyerId,
+      );
+      if (activeDuplicate) {
+        throw new AppException(
+          ErrorCode.INVALID_ORDER_STATUS,
+          'An active order already exists for this buyer and offer.',
+        );
+      }
+      const deployment = await this.escrowService.deployEscrowToChain(orderId, {
         sellerAddress: dto.sellerAddress,
         buyerAddress: dto.buyerAddress,
         amount: Number(dto.assetAmount),
         assetCode: dto.assetCode,
         title: dto.title ?? `Order ${orderId}`,
       });
+      contractId = deployment.contractId;
+      unsignedFundTransaction = deployment.unsignedFundTransaction;
+      await this.repo.saveOrderDeployment(
+        dto.idempotencyKey,
+        contractId,
+        unsignedFundTransaction,
+      );
+    }
+    if (!contractId || !unsignedFundTransaction) {
+      throw new ConflictException(
+        `Escrow deployment for order ${orderId} needs reconciliation`,
+      );
+    }
 
     this.logger.log(
       `Escrow deployed (contract=${contractId}). Persisting order + escrow in DBÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦`,
@@ -150,6 +216,7 @@ export class OrderService {
     const order: OrderCreateResponse = (await this.repo.create(
       data,
     )) as OrderCreateResponse;
+    await this.repo.completeOrderCreation(dto.idempotencyKey);
 
     this.logger.log(`Order ${orderId} and escrow persisted successfully.`);
 
@@ -159,6 +226,28 @@ export class OrderService {
       escrow: order.escrowId ? { escrowId: order.escrowId } : undefined,
       contractId,
       unsignedFundTransaction,
+    };
+  }
+
+  async getCreationStatus(idempotencyKey: string, userId: string) {
+    const reservation =
+      await this.repo.getOrderCreationReservation(idempotencyKey);
+    if (!reservation) {
+      throw new AppException(
+        ErrorCode.ORDER_NOT_FOUND,
+        `Order creation ${idempotencyKey} not found`,
+      );
+    }
+    if (reservation.buyer_id !== userId && reservation.seller_id !== userId) {
+      throw new AppException(
+        ErrorCode.UNAUTHORIZED_ACTION,
+        'Only the order buyer or seller can inspect its creation status',
+      );
+    }
+    return {
+      orderId: reservation.order_id,
+      status: reservation.status,
+      contractId: reservation.contract_id,
     };
   }
 

@@ -44,6 +44,15 @@ export class OrderController {
     return this.service.list(p, q);
   }
 
+  @Get('creation/:idempotencyKey')
+  @UseGuards(JwtAuthGuard, SetupCompleteGuard)
+  getCreationStatus(
+    @Param('idempotencyKey') idempotencyKey: string,
+    @CurrentUser() user: { userId: string },
+  ) {
+    return this.service.getCreationStatus(idempotencyKey, user.userId);
+  }
+
   @Get('user-stats/:userId')
   @UseGuards(JwtAuthGuard)
   getUserStats(

@@ -40,6 +40,7 @@ export class ChatMessageRepository extends BaseRepository {
     senderId: string;
     content: string;
     clientMessageId?: string;
+    attachmentRefs?: Prisma.InputJsonValue;
   }) {
     if (!data.clientMessageId) return this.create(data as Record<string, unknown>);
     return this.prisma.chatMessage.upsert({
@@ -53,6 +54,12 @@ export class ChatMessageRepository extends BaseRepository {
       create: data,
       update: {},
     });
+  }
+  findEvidenceForOrder(orderId: string, evidenceIds: string[]) {
+    return this.prisma.escrowOnChain.findMany({ where: { orderId, escrowId: { in: evidenceIds }, evidenceUrl: { not: null } }, select: { escrowId: true, evidenceUrl: true, evidenceKey: true, evidenceFileName: true, evidenceContentType: true, evidenceSize: true } });
+  }
+  findMessageOrderAndAttachmentRefs(messageId: string) {
+    return this.prisma.chatMessage.findUnique({ where: { messageId }, select: { orderId: true, attachmentRefs: true } });
   }
   async markDelivered(orderId: string, recipientId: string) {
     const participants = await this.findOrderParticipants(orderId);

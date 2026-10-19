@@ -43,6 +43,17 @@ export function calculateFiatAmount(assetAmount: string | number, price: string 
   return `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
 }
 
+export interface OrderCreationReservation {
+  idempotency_key: string;
+  order_id: string;
+  request_hash: string;
+  buyer_id: string;
+  seller_id: string;
+  status: 'pending' | 'deployed' | 'completed';
+  contract_id: string | null;
+  unsigned_fund_transaction: string | null;
+}
+
 @Injectable()
 export class OrderRepository extends BaseRepository {
   constructor(private readonly prisma: PrismaService) {
@@ -58,6 +69,63 @@ export class OrderRepository extends BaseRepository {
       },
       select: { orderId: true },
     });
+  }
+
+  async reserveOrderCreation(input: {
+    idempotencyKey: string;
+    requestHash: string;
+    buyerId: string;
+    sellerId: string;
+  }): Promise<{ reservation: OrderCreationReservation; created: boolean }> {
+    const inserted = await this.prisma.$executeRaw`
+      INSERT INTO order_creation_reservation
+        (idempotency_key, order_id, request_hash, buyer_id, seller_id)
+      VALUES
+        (${input.idempotencyKey}::uuid, ${input.idempotencyKey}::uuid,
+         ${input.requestHash}, ${input.buyerId}::uuid, ${input.sellerId}::uuid)
+      ON CONFLICT (idempotency_key) DO NOTHING
+    `;
+    const rows = await this.prisma.$queryRaw<OrderCreationReservation[]>`
+      SELECT idempotency_key, order_id, request_hash, buyer_id, seller_id,
+             status, contract_id, unsigned_fund_transaction
+      FROM order_creation_reservation
+      WHERE idempotency_key = ${input.idempotencyKey}::uuid
+    `;
+    if (!rows[0]) throw new Error('Order creation reservation was not persisted');
+    return { reservation: rows[0], created: inserted === 1 };
+  }
+
+  async saveOrderDeployment(
+    idempotencyKey: string,
+    contractId: string,
+    unsignedFundTransaction: string,
+  ): Promise<void> {
+    await this.prisma.$executeRaw`
+      UPDATE order_creation_reservation
+      SET status = 'deployed', contract_id = ${contractId},
+          unsigned_fund_transaction = ${unsignedFundTransaction}, updated_at = NOW()
+      WHERE idempotency_key = ${idempotencyKey}::uuid AND status = 'pending'
+    `;
+  }
+
+  async completeOrderCreation(idempotencyKey: string): Promise<void> {
+    await this.prisma.$executeRaw`
+      UPDATE order_creation_reservation
+      SET status = 'completed', updated_at = NOW()
+      WHERE idempotency_key = ${idempotencyKey}::uuid AND status = 'deployed'
+    `;
+  }
+
+  getOrderCreationReservation(
+    idempotencyKey: string,
+  ): Promise<OrderCreationReservation | null> {
+    return this.prisma.$queryRaw<OrderCreationReservation[]>`
+      SELECT idempotency_key, order_id, request_hash, buyer_id, seller_id,
+             status, contract_id, unsigned_fund_transaction
+      FROM order_creation_reservation
+      WHERE idempotency_key = ${idempotencyKey}::uuid
+    `.then((rows) => rows[0] ?? null);
+  }
   }
 
   // Override create to atomically create order+escrow and mark the offer as executed.
